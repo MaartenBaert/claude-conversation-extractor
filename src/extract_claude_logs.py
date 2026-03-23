@@ -65,12 +65,13 @@ class ClaudeConversationExtractor:
                 sessions.append(jsonl_file)
         return sorted(sessions, key=lambda x: x.stat().st_mtime, reverse=True)
 
-    def extract_conversation(self, jsonl_path: Path, detailed: bool = False) -> List[Dict[str, str]]:
+    def extract_conversation(self, jsonl_path: Path, detailed: bool = False, thinking: bool = False) -> List[Dict[str, str]]:
         """Extract conversation messages from a JSONL file.
-        
+
         Args:
             jsonl_path: Path to the JSONL file
             detailed: If True, include tool use, MCP responses, and system messages
+            thinking: If True, include extended thinking blocks
         """
         conversation = []
 
@@ -101,7 +102,7 @@ class ClaudeConversationExtractor:
                             msg = entry["message"]
                             if isinstance(msg, dict) and msg.get("role") == "assistant":
                                 content = msg.get("content", [])
-                                text = self._extract_text_content(content, detailed=detailed)
+                                text = self._extract_text_content(content, detailed=detailed, thinking=thinking)
 
                                 if text and text.strip():
                                     conversation.append(
@@ -162,12 +163,13 @@ class ClaudeConversationExtractor:
 
         return conversation
 
-    def _extract_text_content(self, content, detailed: bool = False) -> str:
+    def _extract_text_content(self, content, detailed: bool = False, thinking: bool = False) -> str:
         """Extract text from various content formats Claude uses.
-        
+
         Args:
             content: The content to extract from
             detailed: If True, include tool use blocks and other metadata
+            thinking: If True, include extended thinking blocks
         """
         if isinstance(content, str):
             return content
@@ -178,6 +180,10 @@ class ClaudeConversationExtractor:
                 if isinstance(item, dict):
                     if item.get("type") == "text":
                         text_parts.append(item.get("text", ""))
+                    elif thinking and item.get("type") == "thinking":
+                        thinking_text = item.get("thinking", "")
+                        if thinking_text:
+                            text_parts.append(f"\n💭 Thinking:\n{thinking_text}\n")
                     elif detailed and item.get("type") == "tool_use":
                         # Include tool use details in detailed mode
                         tool_name = item.get("name", "unknown")
@@ -188,16 +194,17 @@ class ClaudeConversationExtractor:
         else:
             return str(content)
 
-    def display_conversation(self, jsonl_path: Path, detailed: bool = False) -> None:
+    def display_conversation(self, jsonl_path: Path, detailed: bool = False, thinking: bool = False) -> None:
         """Display a conversation in the terminal with pagination.
-        
+
         Args:
             jsonl_path: Path to the JSONL file
             detailed: If True, include tool use and system messages
+            thinking: If True, include extended thinking blocks
         """
         try:
             # Extract conversation
-            messages = self.extract_conversation(jsonl_path, detailed=detailed)
+            messages = self.extract_conversation(jsonl_path, detailed=detailed, thinking=thinking)
             
             if not messages:
                 print("❌ No messages found in conversation")
@@ -247,6 +254,8 @@ class ClaudeConversationExtractor:
                     print(f"\n📤 TOOL RESULT:")
                 elif role == "system":
                     print(f"\nℹ️ SYSTEM:")
+                elif role == "thinking":
+                    print(f"\n💭 THINKING:")
                 else:
                     print(f"\n{role.upper()}:")
                 
@@ -335,6 +344,9 @@ class ClaudeConversationExtractor:
                     f.write(f"{content}\n\n")
                 elif role == "system":
                     f.write("### ℹ️ System\n\n")
+                    f.write(f"{content}\n\n")
+                elif role == "thinking":
+                    f.write("### 💭 Thinking\n\n")
                     f.write(f"{content}\n\n")
                 else:
                     f.write(f"## {role}\n\n")
@@ -666,16 +678,17 @@ class ClaudeConversationExtractor:
         return sessions[:limit]
 
     def extract_multiple(
-        self, sessions: List[Path], indices: List[int], 
-        format: str = "markdown", detailed: bool = False
+        self, sessions: List[Path], indices: List[int],
+        format: str = "markdown", detailed: bool = False, thinking: bool = False
     ) -> Tuple[int, int]:
         """Extract multiple sessions by index.
-        
+
         Args:
             sessions: List of session paths
             indices: Indices to extract
             format: Output format ('markdown', 'json', 'html')
             detailed: If True, include tool use and system messages
+            thinking: If True, include extended thinking blocks
         """
         success = 0
         total = len(indices)
@@ -683,7 +696,7 @@ class ClaudeConversationExtractor:
         for idx in indices:
             if 0 <= idx < len(sessions):
                 session_path = sessions[idx]
-                conversation = self.extract_conversation(session_path, detailed=detailed)
+                conversation = self.extract_conversation(session_path, detailed=detailed, thinking=thinking)
                 if conversation:
                     output_path = self.save_conversation(conversation, session_path.stem, format=format)
                     success += 1
@@ -717,6 +730,7 @@ Examples:
   %(prog)s --format json --all       # Export all as JSON
   %(prog)s --format html --extract 1 # Export session 1 as HTML
   %(prog)s --detailed --extract 1    # Include tool use & system messages
+  %(prog)s --thinking --extract 1    # Include extended thinking blocks
         """,
     )
     parser.add_argument("--list", action="store_true", help="List recent sessions")
@@ -785,6 +799,11 @@ Examples:
         "--detailed",
         action="store_true",
         help="Include tool use, MCP responses, and system messages in export"
+    )
+    parser.add_argument(
+        "--thinking",
+        action="store_true",
+        help="Include extended thinking blocks in export"
     )
 
     args = parser.parse_args()
@@ -880,12 +899,12 @@ Examples:
                     view_num = int(view_choice)
                     if 1 <= view_num <= len(file_paths_list):
                         selected_path = file_paths_list[view_num - 1]
-                        extractor.display_conversation(selected_path, detailed=args.detailed)
-                        
+                        extractor.display_conversation(selected_path, detailed=args.detailed, thinking=args.thinking)
+
                         # Offer to extract after viewing
                         extract_choice = input("\n📤 Extract this conversation? (y/N): ").strip().lower()
                         if extract_choice == 'y':
-                            conversation = extractor.extract_conversation(selected_path, detailed=args.detailed)
+                            conversation = extractor.extract_conversation(selected_path, detailed=args.detailed, thinking=args.thinking)
                             if conversation:
                                 session_id = selected_path.stem
                                 if args.format == "json":
@@ -933,8 +952,10 @@ Examples:
             print(f"\n📤 Extracting {len(indices)} session(s) as {args.format.upper()}...")
             if args.detailed:
                 print("📋 Including detailed tool use and system messages")
+            if args.thinking:
+                print("💭 Including extended thinking blocks")
             success, total = extractor.extract_multiple(
-                sessions, indices, format=args.format, detailed=args.detailed
+                sessions, indices, format=args.format, detailed=args.detailed, thinking=args.thinking
             )
             print(f"\n✅ Successfully extracted {success}/{total} sessions")
 
@@ -944,10 +965,12 @@ Examples:
         print(f"\n📤 Extracting {limit} most recent sessions as {args.format.upper()}...")
         if args.detailed:
             print("📋 Including detailed tool use and system messages")
+        if args.thinking:
+            print("💭 Including extended thinking blocks")
 
         indices = list(range(limit))
         success, total = extractor.extract_multiple(
-            sessions, indices, format=args.format, detailed=args.detailed
+            sessions, indices, format=args.format, detailed=args.detailed, thinking=args.thinking
         )
         print(f"\n✅ Successfully extracted {success}/{total} sessions")
 
@@ -956,10 +979,12 @@ Examples:
         print(f"\n📤 Extracting all {len(sessions)} sessions as {args.format.upper()}...")
         if args.detailed:
             print("📋 Including detailed tool use and system messages")
+        if args.thinking:
+            print("💭 Including extended thinking blocks")
 
         indices = list(range(len(sessions)))
         success, total = extractor.extract_multiple(
-            sessions, indices, format=args.format, detailed=args.detailed
+            sessions, indices, format=args.format, detailed=args.detailed, thinking=args.thinking
         )
         print(f"\n✅ Successfully extracted {success}/{total} sessions")
 
