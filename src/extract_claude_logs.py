@@ -11,26 +11,30 @@ import argparse
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from .source_config import get_source_config, normalize_source
+except ImportError:
+    from source_config import get_source_config, normalize_source
 
 
 class ClaudeConversationExtractor:
     """Extract and convert Claude Code conversations from JSONL to markdown."""
 
-    def __init__(self, output_dir: Optional[Path] = None):
-        """Initialize the extractor with Claude's directory and output location."""
-        self.claude_dir = Path.home() / ".claude" / "projects"
+    def __init__(self, output_dir: Optional[Path] = None, source: str = "claude"):
+        """Initialize the extractor with source directory and output location."""
+        self.source = normalize_source(source)
+        self.source_config = get_source_config(self.source)
+        self.claude_dir = self.source_config["session_dir"]
+        self.session_dir = self.claude_dir
 
         if output_dir:
             self.output_dir = Path(output_dir)
             self.output_dir.mkdir(parents=True, exist_ok=True)
         else:
-            # Try multiple possible output directories
-            possible_dirs = [
-                Path.home() / "Desktop" / "Claude logs",
-                Path.home() / "Documents" / "Claude logs",
-                Path.home() / "Claude logs",
-                Path.cwd() / "claude-logs",
+            possible_dirs = self.source_config["default_output_dirs"] + [
+                self.source_config["default_output_fallback"]
             ]
 
             # Use the first directory we can create
@@ -46,8 +50,7 @@ class ClaudeConversationExtractor:
                 except Exception:
                     continue
             else:
-                # Fallback to current directory
-                self.output_dir = Path.cwd() / "claude-logs"
+                self.output_dir = self.source_config["default_output_fallback"]
                 self.output_dir.mkdir(exist_ok=True)
 
         print(f"📁 Saving logs to: {self.output_dir}")
@@ -55,14 +58,14 @@ class ClaudeConversationExtractor:
     def find_sessions(self, project_path: Optional[str] = None) -> List[Path]:
         """Find all JSONL session files, sorted by most recent first."""
         if project_path:
-            search_dir = self.claude_dir / project_path
+            search_dir = self.session_dir / project_path
         else:
-            search_dir = self.claude_dir
+            search_dir = self.session_dir
 
         sessions = []
         if search_dir.exists():
-            for jsonl_file in search_dir.rglob("*.jsonl"):
-                sessions.append(jsonl_file)
+            for session_file in search_dir.rglob(self.source_config["session_glob"]):
+                sessions.append(session_file)
         return sorted(sessions, key=lambda x: x.stat().st_mtime, reverse=True)
 
     def extract_conversation(self, jsonl_path: Path, detailed: bool = False, thinking: bool = False) -> List[Dict[str, str]]:
@@ -73,6 +76,17 @@ class ClaudeConversationExtractor:
             detailed: If True, include tool use, MCP responses, and system messages
             thinking: If True, include extended thinking blocks
         """
+        if self.source == "copilot":
+            return self._extract_copilot_conversation(
+                jsonl_path, detailed=detailed, thinking=thinking
+            )
+        return self._extract_claude_conversation(
+            jsonl_path, detailed=detailed, thinking=thinking
+        )
+
+    def _extract_claude_conversation(
+        self, jsonl_path: Path, detailed: bool = False, thinking: bool = False
+    ) -> List[Dict[str, str]]:
         conversation = []
 
         try:
@@ -81,87 +95,192 @@ class ClaudeConversationExtractor:
                     try:
                         entry = json.loads(line.strip())
 
-                        # Extract user messages
                         if entry.get("type") == "user" and "message" in entry:
                             msg = entry["message"]
                             if isinstance(msg, dict) and msg.get("role") == "user":
-                                content = msg.get("content", "")
-                                text = self._extract_text_content(content)
+                                text = self._extract_text_content(msg.get("content", ""))
+                                self._append_message(conversation, "user", text, entry.get("timestamp", ""))
 
-                                if text and text.strip():
-                                    conversation.append(
-                                        {
-                                            "role": "user",
-                                            "content": text,
-                                            "timestamp": entry.get("timestamp", ""),
-                                        }
-                                    )
-
-                        # Extract assistant messages
                         elif entry.get("type") == "assistant" and "message" in entry:
                             msg = entry["message"]
                             if isinstance(msg, dict) and msg.get("role") == "assistant":
-                                content = msg.get("content", [])
-                                text = self._extract_text_content(content, detailed=detailed, thinking=thinking)
+                                text = self._extract_text_content(
+                                    msg.get("content", []), detailed=detailed, thinking=thinking
+                                )
+                                self._append_message(
+                                    conversation, "assistant", text, entry.get("timestamp", "")
+                                )
 
-                                if text and text.strip():
-                                    conversation.append(
-                                        {
-                                            "role": "assistant",
-                                            "content": text,
-                                            "timestamp": entry.get("timestamp", ""),
-                                        }
-                                    )
-                        
-                        # Include tool use and system messages if detailed mode
                         elif detailed:
-                            # Extract tool use events
                             if entry.get("type") == "tool_use":
                                 tool_data = entry.get("tool", {})
-                                tool_name = tool_data.get("name", "unknown")
-                                tool_input = tool_data.get("input", {})
-                                conversation.append(
-                                    {
-                                        "role": "tool_use",
-                                        "content": f"🔧 Tool: {tool_name}\nInput: {json.dumps(tool_input, indent=2)}",
-                                        "timestamp": entry.get("timestamp", ""),
-                                    }
+                                self._append_message(
+                                    conversation,
+                                    "tool_use",
+                                    f"🔧 Tool: {tool_data.get('name', 'unknown')}\n"
+                                    f"Input: {json.dumps(tool_data.get('input', {}), indent=2)}",
+                                    entry.get("timestamp", ""),
                                 )
-                            
-                            # Extract tool results
                             elif entry.get("type") == "tool_result":
                                 result = entry.get("result", {})
                                 output = result.get("output", "") or result.get("error", "")
-                                conversation.append(
-                                    {
-                                        "role": "tool_result",
-                                        "content": f"📤 Result:\n{output}",
-                                        "timestamp": entry.get("timestamp", ""),
-                                    }
+                                self._append_message(
+                                    conversation,
+                                    "tool_result",
+                                    f"📤 Result:\n{output}",
+                                    entry.get("timestamp", ""),
                                 )
-                            
-                            # Extract system messages
                             elif entry.get("type") == "system" and "message" in entry:
-                                msg = entry.get("message", "")
-                                if msg:
-                                    conversation.append(
-                                        {
-                                            "role": "system",
-                                            "content": f"ℹ️ System: {msg}",
-                                            "timestamp": entry.get("timestamp", ""),
-                                        }
-                                    )
+                                self._append_message(
+                                    conversation,
+                                    "system",
+                                    f"ℹ️ System: {entry.get('message', '')}",
+                                    entry.get("timestamp", ""),
+                                )
 
                     except json.JSONDecodeError:
                         continue
                     except Exception:
-                        # Silently skip problematic entries
                         continue
 
         except Exception as e:
             print(f"❌ Error reading file {jsonl_path}: {e}")
 
         return conversation
+
+    def _extract_copilot_conversation(
+        self, jsonl_path: Path, detailed: bool = False, thinking: bool = False
+    ) -> List[Dict[str, str]]:
+        conversation = []
+
+        try:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line.strip())
+                        event_type = entry.get("type", "")
+                        data = entry.get("data", {})
+                        timestamp = entry.get("timestamp", "")
+
+                        if event_type == "user.message":
+                            text = self._extract_copilot_text_content(
+                                data.get("content", "") or data.get("transformedContent", "")
+                            )
+                            self._append_message(conversation, "user", text, timestamp)
+
+                        elif event_type == "assistant.message":
+                            text = self._extract_copilot_text_content(data.get("content", ""))
+                            if thinking and data.get("reasoningText"):
+                                text = f"{text}\n\n💭 Thinking:\n{data.get('reasoningText')}"
+                            self._append_message(conversation, "assistant", text, timestamp)
+
+                        elif detailed and event_type == "tool.execution_start":
+                            self._append_message(
+                                conversation,
+                                "tool_use",
+                                f"🔧 Tool: {data.get('toolName', 'unknown')}\n"
+                                f"Input: {self._stringify_value(data.get('arguments', {}))}",
+                                timestamp,
+                            )
+
+                        elif detailed and event_type == "tool.execution_complete":
+                            result_prefix = "📤 Result" if data.get("success") else "❌ Error"
+                            payload = data.get("result") if data.get("success") else data.get("error")
+                            self._append_message(
+                                conversation,
+                                "tool_result",
+                                f"{result_prefix}:\n{self._stringify_value(payload)}",
+                                timestamp,
+                            )
+
+                        elif detailed and event_type in {
+                            "session.info",
+                            "session.warning",
+                            "session.resume",
+                            "session.shutdown",
+                            "system.notification",
+                            "abort",
+                            "subagent.started",
+                        }:
+                            summary = data.get("message") or self._stringify_value(data)
+                            self._append_message(
+                                conversation,
+                                "system",
+                                f"ℹ️ {event_type}: {summary}",
+                                timestamp,
+                            )
+
+                    except json.JSONDecodeError:
+                        continue
+                    except Exception:
+                        continue
+
+        except Exception as e:
+            print(f"❌ Error reading file {jsonl_path}: {e}")
+
+        return conversation
+
+    def _append_message(
+        self, conversation: List[Dict[str, str]], role: str, content: str, timestamp: str
+    ) -> None:
+        if content and content.strip():
+            conversation.append(
+                {
+                    "role": role,
+                    "content": content,
+                    "timestamp": timestamp,
+                }
+            )
+
+    def _extract_copilot_text_content(self, content: Any) -> str:
+        """Extract text from Copilot event payloads."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(self._extract_copilot_text_content(item) for item in content if item)
+        if isinstance(content, dict):
+            if isinstance(content.get("text"), str):
+                return content["text"]
+            return self._stringify_value(content)
+        return str(content)
+
+    def _stringify_value(self, value: Any) -> str:
+        """Format structured values for readable export."""
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, indent=2, ensure_ascii=False)
+        return str(value)
+
+    def _get_session_id(self, session_path: Path) -> str:
+        """Return a stable session identifier for the active source."""
+        if self.source == "copilot" and session_path.name == "events.jsonl":
+            return session_path.parent.name
+        return session_path.stem
+
+    def _get_session_display_name(self, session_path: Path) -> str:
+        """Return the best available project/workspace label for a session."""
+        if self.source == "copilot":
+            try:
+                with open(session_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        entry = json.loads(line.strip())
+                        if entry.get("type") == "session.start":
+                            context = entry.get("data", {}).get("context", {})
+                            cwd = context.get("cwd")
+                            if cwd:
+                                return Path(cwd).name or cwd
+                        if entry.get("type") == "user.message":
+                            break
+            except Exception:
+                pass
+            return session_path.parent.name
+
+        project = session_path.parent.name.replace("-", " ").strip()
+        if project.startswith("Users"):
+            parts = project.split()
+            project = "~/" + "/".join(parts[2:]) if len(parts) > 2 else "Home"
+        return project
 
     def _extract_text_content(self, content, detailed: bool = False, thinking: bool = False) -> str:
         """Extract text from various content formats Claude uses.
@@ -211,12 +330,12 @@ class ClaudeConversationExtractor:
                 return
             
             # Get session info
-            session_id = jsonl_path.stem
+            session_id = self._get_session_id(jsonl_path)
             
             # Clear screen and show header
             print("\033[2J\033[H", end="")  # Clear screen
             print("=" * 60)
-            print(f"📄 Viewing: {jsonl_path.parent.name}")
+            print(f"📄 Viewing: {self._get_session_display_name(jsonl_path)}")
             print(f"Session: {session_id[:8]}...")
             
             # Get timestamp from first message
@@ -246,7 +365,7 @@ class ClaudeConversationExtractor:
                     print(f"{'─' * 40}")
                 elif role == "assistant":
                     print(f"\n{'─' * 40}")
-                    print(f"🤖 CLAUDE:")
+                    print(f"🤖 {self.source_config['assistant_terminal_name']}:")
                     print(f"{'─' * 40}")
                 elif role == "tool_use":
                     print(f"\n🔧 TOOL USE:")
@@ -315,11 +434,11 @@ class ClaudeConversationExtractor:
             date_str = datetime.now().strftime("%Y-%m-%d")
             time_str = ""
 
-        filename = f"claude-conversation-{date_str}-{session_id[:8]}.md"
+        filename = f"{self.source_config['conversation_prefix']}-{date_str}-{session_id[:8]}.md"
         output_path = self.output_dir / filename
 
         with open(output_path, "w", encoding="utf-8") as f:
-            f.write("# Claude Conversation Log\n\n")
+            f.write(f"# {self.source_config['conversation_title']}\n\n")
             f.write(f"Session ID: {session_id}\n")
             f.write(f"Date: {date_str}")
             if time_str:
@@ -334,7 +453,7 @@ class ClaudeConversationExtractor:
                     f.write("## 👤 User\n\n")
                     f.write(f"{content}\n\n")
                 elif role == "assistant":
-                    f.write("## 🤖 Claude\n\n")
+                    f.write(f"{self.source_config['assistant_heading']}\n\n")
                     f.write(f"{content}\n\n")
                 elif role == "tool_use":
                     f.write("### 🔧 Tool Use\n\n")
@@ -373,11 +492,12 @@ class ClaudeConversationExtractor:
         else:
             date_str = datetime.now().strftime("%Y-%m-%d")
 
-        filename = f"claude-conversation-{date_str}-{session_id[:8]}.json"
+        filename = f"{self.source_config['conversation_prefix']}-{date_str}-{session_id[:8]}.json"
         output_path = self.output_dir / filename
 
         # Create JSON structure
         output = {
+            "source": self.source,
             "session_id": session_id,
             "date": date_str,
             "message_count": len(conversation),
@@ -410,7 +530,7 @@ class ClaudeConversationExtractor:
             date_str = datetime.now().strftime("%Y-%m-%d")
             time_str = ""
 
-        filename = f"claude-conversation-{date_str}-{session_id[:8]}.html"
+        filename = f"{self.source_config['conversation_prefix']}-{date_str}-{session_id[:8]}.html"
         output_path = self.output_dir / filename
 
         # HTML template with modern styling
@@ -419,7 +539,7 @@ class ClaudeConversationExtractor:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Claude Conversation - {session_id[:8]}</title>
+    <title>{self.source_config['display_name']} Conversation - {session_id[:8]}</title>
     <style>
         body {{
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -496,7 +616,7 @@ class ClaudeConversationExtractor:
 </head>
 <body>
     <div class="header">
-        <h1>Claude Conversation Log</h1>
+        <h1>{self.source_config['conversation_title']}</h1>
         <div class="metadata">
             <p>Session ID: {session_id}</p>
             <p>Date: {date_str} {time_str}</p>
@@ -519,7 +639,7 @@ class ClaudeConversationExtractor:
                 
                 role_display = {
                     "user": "👤 User",
-                    "assistant": "🤖 Claude",
+                    "assistant": f"🤖 {self.source_config['assistant_name']}",
                     "tool_use": "🔧 Tool Use",
                     "tool_result": "📤 Tool Result",
                     "system": "ℹ️ System"
@@ -556,6 +676,9 @@ class ClaudeConversationExtractor:
 
     def get_conversation_preview(self, session_path: Path) -> Tuple[str, int]:
         """Get a preview of the conversation's first real user message and message count."""
+        if self.source == "copilot":
+            return self._get_copilot_conversation_preview(session_path)
+
         try:
             first_user_msg = ""
             msg_count = 0
@@ -636,27 +759,53 @@ class ClaudeConversationExtractor:
         except Exception as e:
             return f"Error: {str(e)[:30]}", 0
 
+    def _get_copilot_conversation_preview(self, session_path: Path) -> Tuple[str, int]:
+        """Get a preview of the first Copilot user message and message count."""
+        try:
+            first_user_msg = ""
+            msg_count = 0
+
+            with open(session_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    event_type = data.get("type")
+                    if event_type in {"user.message", "assistant.message"}:
+                        msg_count += 1
+
+                    if not first_user_msg and event_type == "user.message":
+                        text = self._extract_copilot_text_content(
+                            data.get("data", {}).get("content", "")
+                        ).strip()
+                        if text:
+                            first_user_msg = text[:100].replace("\n", " ")
+
+            return first_user_msg or "No preview available", msg_count
+        except Exception as e:
+            return f"Error: {str(e)[:30]}", 0
+
     def list_recent_sessions(self, limit: int = None) -> List[Path]:
         """List recent sessions with details."""
         sessions = self.find_sessions()
 
         if not sessions:
-            print("❌ No Claude sessions found in ~/.claude/projects/")
-            print("💡 Make sure you've used Claude Code and have conversations saved.")
+            print(f"❌ {self.source_config['no_sessions_message']}")
+            print(
+                f"💡 Make sure you've used {self.source_config['display_name']} and have conversations saved."
+            )
             return []
 
-        print(f"\n📚 Found {len(sessions)} Claude sessions:\n")
+        print(f"\n📚 Found {len(sessions)} {self.source_config['display_name']} sessions:\n")
         print("=" * 80)
 
         # Show all sessions if no limit specified
         sessions_to_show = sessions[:limit] if limit else sessions
         for i, session in enumerate(sessions_to_show, 1):
-            # Clean up project name (remove hyphens, make readable)
-            project = session.parent.name.replace('-', ' ').strip()
-            if project.startswith("Users"):
-                project = "~/" + "/".join(project.split()[2:]) if len(project.split()) > 2 else "Home"
-            
-            session_id = session.stem
+            project = self._get_session_display_name(session)
+            session_id = self._get_session_id(session)
             modified = datetime.fromtimestamp(session.stat().st_mtime)
 
             # Get file size
@@ -698,7 +847,9 @@ class ClaudeConversationExtractor:
                 session_path = sessions[idx]
                 conversation = self.extract_conversation(session_path, detailed=detailed, thinking=thinking)
                 if conversation:
-                    output_path = self.save_conversation(conversation, session_path.stem, format=format)
+                    output_path = self.save_conversation(
+                        conversation, self._get_session_id(session_path), format=format
+                    )
                     success += 1
                     msg_count = len(conversation)
                     print(
@@ -805,26 +956,38 @@ Examples:
         action="store_true",
         help="Include extended thinking blocks in export"
     )
+    parser.add_argument(
+        "--copilot",
+        action="store_true",
+        help="Extract and search GitHub Copilot CLI sessions from ~/.copilot/session-state",
+    )
 
     args = parser.parse_args()
+    source = "copilot" if args.copilot else "claude"
 
     # Handle interactive mode
     if args.interactive or (args.export and args.export.lower() == "logs"):
-        from interactive_ui import main as interactive_main
+        try:
+            from .interactive_ui import main as interactive_main
+        except ImportError:
+            from interactive_ui import main as interactive_main
 
-        interactive_main()
+        interactive_main(source=source)
         return
 
     # Initialize extractor with optional output directory
-    extractor = ClaudeConversationExtractor(args.output)
+    extractor = ClaudeConversationExtractor(args.output, source=source)
 
     # Handle search mode
     if args.search or args.search_regex:
         from datetime import datetime
 
-        from search_conversations import ConversationSearcher
+        try:
+            from .search_conversations import ConversationSearcher
+        except ImportError:
+            from search_conversations import ConversationSearcher
 
-        searcher = ConversationSearcher()
+        searcher = ConversationSearcher(source=source)
 
         # Determine search mode and query
         if args.search_regex:
@@ -906,7 +1069,7 @@ Examples:
                         if extract_choice == 'y':
                             conversation = extractor.extract_conversation(selected_path, detailed=args.detailed, thinking=args.thinking)
                             if conversation:
-                                session_id = selected_path.stem
+                                session_id = extractor._get_session_id(selected_path)
                                 if args.format == "json":
                                     output = extractor.save_as_json(conversation, session_id)
                                 elif args.format == "html":
@@ -934,6 +1097,8 @@ Examples:
             print("  claude-extract --extract <number>      # Extract specific session")
             print("  claude-extract --recent 5              # Extract 5 most recent")
             print("  claude-extract --all                   # Extract all sessions")
+            if args.copilot:
+                print("  claude-extract --copilot --extract <number>")
 
     elif args.extract:
         sessions = extractor.find_sessions()
@@ -1011,8 +1176,9 @@ def launch_interactive():
             from search_conversations import ConversationSearcher
         
         # Initialize components
-        extractor = ClaudeConversationExtractor()
-        searcher = ConversationSearcher()
+        source = "copilot" if "--copilot" in sys.argv[2:] else "claude"
+        extractor = ClaudeConversationExtractor(source=source)
+        searcher = ConversationSearcher(source=source)
         smart_searcher = create_smart_searcher(searcher)
         
         # Run search
@@ -1029,7 +1195,7 @@ def launch_interactive():
                 if extract_choice == 'y':
                     conversation = extractor.extract_conversation(selected_file)
                     if conversation:
-                        session_id = selected_file.stem
+                        session_id = extractor._get_session_id(selected_file)
                         output = extractor.save_as_markdown(conversation, session_id)
                         print(f"✅ Saved: {output.name}")
             except (EOFError, KeyboardInterrupt):
